@@ -1,11 +1,9 @@
 -- MHW_AutoDodge.lua
--- Auto Evade and Auto Guard for Bow and Heavy Bowgun in Monster Hunter Wilds.
--- Restored from confirmed-working version (session log line 930).
+-- Auto Perfect Dodge (Bow) and Auto Perfect Guard (HBG) for Monster Hunter Wilds.
 --
--- Only change from the confirmed working version:
---   Bow: beginDodgeNoHit(System.Boolean, false) instead of no-arg (which failed silently),
---        giving the pre-dodge state (Cat=2 Idx=9) that upgrades to perfect dodge (Cat=2 Idx=33).
---   HBG: UNCHANGED from working version — grantIframes + changeActionRequest(1, 146).
+-- Bow: beginDodgeNoHit(bool) → pre-dodge state (Cat=2 Idx=9) → changeActionRequest(Cat=2 Idx=33)
+-- HBG: startNoHitTimer + changeActionRequest(Cat=1 Idx=146)
+-- Damage always blocked via SKIP_ORIGINAL once past cooldown/checks.
 
 local CONFIG_PATH = "MHW_AutoDodge.json"
 local BOW         = 11
@@ -14,15 +12,18 @@ local COOLDOWN    = 0.3
 
 local ACT = {
     HBG_PERFECT_GUARD = { cat = 1, idx = 146 },
-    HBG_DODGE         = { cat = 1, idx = 14  },
     BOW_PERFECT_DODGE = { cat = 2, idx = 33  },
 }
+
+-- Cached at load — avoids repeated string lookups inside the hot hook path
+local ACTION_ID_TD = sdk.find_type_definition("ace.ACTION_ID")
+local HUNTER_TD    = sdk.find_type_definition("app.HunterCharacter")
 
 local character  = nil
 local weaponType = -1
 local lastHitAt  = 0
 
-local dbg = { hookFired = 0, skipped = 0, cooldown = 0 }
+local dbg = { hookFired = 0, triggered = 0, cooldown = 0 }
 
 local function defaultConfig()
     return {
@@ -30,8 +31,8 @@ local function defaultConfig()
         evadeEnabled = true,
         evadeIframes = 0.5,
         guardEnabled = true,
-        guardIframes  = 0.25,
-        bypassChecks = true,   -- true by default: ptr comparison is unreliable
+        guardIframes = 0.25,
+        bypassChecks = true,
     }
 end
 
@@ -52,55 +53,39 @@ end
 
 loadConfig()
 
-local function safe(fn)
-    local ok, v = pcall(fn)
-    return ok and v or nil
-end
-
-local function getBaseCtrl()
-    return safe(function() return character:call("get_BaseActionController") end)
-end
-
--- Queue an action on BaseActionController (changeActionRequest, same as working version).
+-- Send a changeActionRequest to the BaseActionController.
+-- Uses the cached ACTION_ID ValueType; falls back to two-int overload.
 local function triggerAction(cat, idx)
-    local ctrl = getBaseCtrl()
-    if not ctrl then return end
-    local ok = pcall(function()
-        local td = sdk.find_type_definition("ace.ACTION_ID")
-        if not td then return end
-        local aid = ValueType.new(td)
-        aid._Category = cat
-        aid._Index    = idx
-        ctrl:call("changeActionRequest(ace.ACTION_ID)", aid)
-    end)
-    if not ok then
-        pcall(function()
-            ctrl:call("changeActionRequest(System.Int32,System.Int32)", cat, idx)
+    if not character then return end
+    local ok, ctrl = pcall(function() return character:call("get_BaseActionController") end)
+    if not ok or not ctrl then return end
+
+    if ACTION_ID_TD then
+        local sent = pcall(function()
+            local aid = ValueType.new(ACTION_ID_TD)
+            aid._Category = cat
+            aid._Index    = idx
+            ctrl:call("changeActionRequest(ace.ACTION_ID)", aid)
         end)
+        if sent then return end
     end
+    pcall(function() ctrl:call("changeActionRequest(System.Int32,System.Int32)", cat, idx) end)
 end
 
--- HBG: iframes via startNoHitTimer (beginDodgeNoHit is for dodge, not guard).
-local function grantIframesHBG(iframes)
-    if not character then return end
-    pcall(function() character:call("startNoHitTimer(System.Single)", iframes) end)
-    pcall(function() character:call("startNoHitTimer", iframes) end)
+-- HBG: iframes only — beginDodgeNoHit is a dodge call, not appropriate for guard.
+local function iframesHBG(dur)
+    pcall(function() character:call("startNoHitTimer(System.Single)", dur) end)
 end
 
--- Bow: beginDodgeNoHit(System.Boolean, false) triggers pre-dodge state (Cat=2 Idx=9),
--- then changeActionRequest(2, 33) upgrades it to perfect dodge.
--- startNoHitTimer provides iframes throughout.
-local function grantIframesBow(iframes)
-    if not character then return end
+-- Bow: beginDodgeNoHit(bool) triggers the pre-dodge state; the subsequent
+-- changeActionRequest(2,33) then upgrades it to perfect dodge.
+local function iframesBow(dur)
     local ok = pcall(function() character:call("beginDodgeNoHit(System.Boolean)", false) end)
-    if not ok then pcall(function() character:call("beginDodgeNoHit(System.Single)", iframes) end) end
-    if not ok then pcall(function() character:call("beginDodgeNoHit(System.Int32)", 0) end) end
-    if not ok then pcall(function() character:call("beginDodgeNoHit(System.Boolean,System.Single)", false, iframes) end) end
-    pcall(function() character:call("startNoHitTimer(System.Single)", iframes) end)
-    pcall(function() character:call("startNoHitTimer", iframes) end)
+    if not ok then   pcall(function() character:call("beginDodgeNoHit(System.Single)", dur) end) end
+    pcall(function() character:call("startNoHitTimer(System.Single)", dur) end)
 end
 
--- Player update
+-- Player update — refresh character ref and weapon type every frame
 re.on_pre_application_entry('BeginRendering', function()
     local ok, char = pcall(function()
         local pm = sdk.get_managed_singleton('app.PlayerManager')
@@ -120,8 +105,7 @@ re.on_pre_application_entry('BeginRendering', function()
 end)
 
 -- Hook
-local hitMethod = sdk.find_type_definition('app.HunterCharacter') and
-    sdk.find_type_definition('app.HunterCharacter'):get_method('evHit_Damage')
+local hitMethod = HUNTER_TD and HUNTER_TD:get_method('evHit_Damage')
 
 if hitMethod then
     sdk.hook(hitMethod,
@@ -131,7 +115,7 @@ if hitMethod then
             dbg.hookFired = dbg.hookFired + 1
 
             local now = os.clock()
-            if (now - lastHitAt) < COOLDOWN then
+            if now - lastHitAt < COOLDOWN then
                 dbg.cooldown = dbg.cooldown + 1
                 return
             end
@@ -139,6 +123,7 @@ if hitMethod then
             if not cfg.bypassChecks then
                 if not character then return end
 
+                -- Verify hit is on our character
                 local mine = false
                 pcall(function() mine = sdk.to_managed_object(args[1]) == character end)
                 if not mine then
@@ -146,49 +131,38 @@ if hitMethod then
                 end
                 if not mine then return end
 
+                -- Verify hit is from an enemy (Em* = monster, Gm* = variant)
                 local enemy = false
-                pcall(function()
-                    local info = sdk.to_managed_object(args[2])
-                    if not info then return end
-                    local owner = info:get_AttackOwner()
-                    if not owner then return end
-                    local name = owner:get_name()
-                    if not name then return end
-                    enemy = name:find("Em") ~= nil or name:find("Gm") ~= nil
-                end)
-                if not enemy then
+                for _, i in ipairs({2, 3}) do
+                    if enemy then break end
                     pcall(function()
-                        local info = sdk.to_managed_object(args[3])
+                        local info = sdk.to_managed_object(args[i])
                         if not info then return end
                         local owner = info:get_AttackOwner()
                         if not owner then return end
                         local name = owner:get_name()
-                        if not name then return end
-                        enemy = name:find("Em") ~= nil or name:find("Gm") ~= nil
+                        if name then
+                            enemy = name:find("Em", 1, true) ~= nil
+                                 or name:find("Gm", 1, true) ~= nil
+                        end
                     end)
                 end
                 if not enemy then return end
             end
 
             lastHitAt = now
-            dbg.skipped = dbg.skipped + 1
-
-            log.info(string.format('[AD] HIT #%d  wt=%d  bypass=%s',
-                dbg.skipped, weaponType, tostring(cfg.bypassChecks)))
+            dbg.triggered = dbg.triggered + 1
 
             if cfg.guardEnabled and weaponType == HBG then
-                grantIframesHBG(cfg.guardIframes)
+                iframesHBG(cfg.guardIframes)
                 triggerAction(ACT.HBG_PERFECT_GUARD.cat, ACT.HBG_PERFECT_GUARD.idx)
-                log.info('[AD] HBG guard triggered')
             elseif cfg.evadeEnabled and (weaponType == BOW or weaponType == HBG) then
-                grantIframesBow(cfg.evadeIframes)
+                iframesBow(cfg.evadeIframes)
                 triggerAction(ACT.BOW_PERFECT_DODGE.cat, ACT.BOW_PERFECT_DODGE.idx)
-                log.info('[AD] bow perfect dodge triggered')
             else
-                log.info('[AD] weapon inactive (' .. tostring(weaponType) .. ')')
+                return  -- not our weapon — let damage through
             end
 
-            -- Unconditional — block damage regardless of draw state
             return sdk.PreHookResult.SKIP_ORIGINAL
         end,
         function(retval) return retval end
@@ -254,7 +228,7 @@ re.on_draw_ui(function()
     c, cfg.bypassChecks = imgui.checkbox('Bypass mine/enemy checks', cfg.bypassChecks)
     changed = changed or c
     imgui.text(string.format('Hook fired:  %d', dbg.hookFired))
-    imgui.text(string.format('Triggered:   %d', dbg.skipped))
+    imgui.text(string.format('Triggered:   %d', dbg.triggered))
     imgui.text(string.format('Cooldown:    %d', dbg.cooldown))
     if imgui.button('Reset counters') then
         for k in pairs(dbg) do dbg[k] = 0 end
