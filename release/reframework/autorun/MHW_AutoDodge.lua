@@ -1,33 +1,28 @@
 -- MHW_AutoDodge.lua
--- Auto Perfect Dodge (Bow) and Auto Perfect Guard (HBG) for Monster Hunter Wilds.
+-- Auto Evade and Auto Guard for Bow and Heavy Bowgun in Monster Hunter Wilds.
+-- Restored from confirmed-working version (session log line 930).
 --
--- Mechanism:
---   Drawn  (Cat>=1): fire guard/dodge immediately via changeActionImmediate
---   Sheathed (Cat=0): send draw action (Cat=1 Idx=2), defer guard/dodge to
---                     BeginRendering once weapon is drawn (Cat>=1)
---
--- Action IDs (BaseActionController):
---   Cat=1 Idx=2    Draw from sheath
---   Cat=1 Idx=141  HBG Guard pre-state
---   Cat=1 Idx=146  HBG Perfect Guard
---   Cat=2 Idx=33   Bow Perfect Dodge  (pre: beginDodgeNoHit → Cat=2 Idx=9 → upgrade to 33)
+-- Only change from the confirmed working version:
+--   Bow: beginDodgeNoHit(System.Boolean, false) instead of no-arg (which failed silently),
+--        giving the pre-dodge state (Cat=2 Idx=9) that upgrades to perfect dodge (Cat=2 Idx=33).
+--   HBG: UNCHANGED from working version — grantIframes + changeActionRequest(1, 146).
 
 local CONFIG_PATH = "MHW_AutoDodge.json"
 local BOW         = 11
 local HBG         = 12
 local COOLDOWN    = 0.3
 
-local character     = nil
-local weaponType    = -1
-local baseActionCat = 0    -- 0=sheathed, 1=drawn, 2=aiming
-local lastHitAt     = 0
+local ACT = {
+    HBG_PERFECT_GUARD = { cat = 1, idx = 146 },
+    HBG_DODGE         = { cat = 1, idx = 14  },
+    BOW_PERFECT_DODGE = { cat = 2, idx = 33  },
+}
 
--- Deferred action: set when hit while sheathed, executed once weapon is drawn
-local pending     = nil    -- "guard" | "dodge"
-local pendingAt   = 0
-local PENDING_MAX = 1.5    -- give up after 1.5s if weapon never draws
+local character  = nil
+local weaponType = -1
+local lastHitAt  = 0
 
-local dbg = { hookFired = 0, triggered = 0, cooldown = 0 }
+local dbg = { hookFired = 0, skipped = 0, cooldown = 0 }
 
 local function defaultConfig()
     return {
@@ -35,8 +30,8 @@ local function defaultConfig()
         evadeEnabled = true,
         evadeIframes = 0.5,
         guardEnabled = true,
-        guardIframes = 0.25,
-        bypassChecks = true,
+        guardIframes  = 0.25,
+        bypassChecks = true,   -- true by default: ptr comparison is unreliable
     }
 end
 
@@ -62,47 +57,50 @@ local function safe(fn)
     return ok and v or nil
 end
 
-local function sendAction(ctrl, cat, idx)
-    local function makeAID()
+local function getBaseCtrl()
+    return safe(function() return character:call("get_BaseActionController") end)
+end
+
+-- Queue an action on BaseActionController (changeActionRequest, same as working version).
+local function triggerAction(cat, idx)
+    local ctrl = getBaseCtrl()
+    if not ctrl then return end
+    local ok = pcall(function()
         local td = sdk.find_type_definition("ace.ACTION_ID")
-        if not td then return nil end
+        if not td then return end
         local aid = ValueType.new(td)
         aid._Category = cat
         aid._Index    = idx
-        return aid
-    end
-    local ok = pcall(function()
-        local aid = makeAID(); if not aid then error() end
-        ctrl:call("changeActionImmediate(ace.ACTION_ID)", aid)
+        ctrl:call("changeActionRequest(ace.ACTION_ID)", aid)
     end)
     if not ok then
         pcall(function()
-            local aid = makeAID(); if not aid then error() end
-            ctrl:call("changeActionRequest(ace.ACTION_ID)", aid)
+            ctrl:call("changeActionRequest(System.Int32,System.Int32)", cat, idx)
         end)
     end
 end
 
--- Fire HBG perfect guard (requires weapon drawn, Cat>=1)
-local function doGuard(ctrl)
-    sendAction(ctrl, 1, 141)  -- guard pre-state
-    sendAction(ctrl, 1, 146)  -- perfect guard
-    pcall(function() character:call("startNoHitTimer(System.Single)", cfg.guardIframes) end)
-    pcall(function() character:call("startNoHitTimer", cfg.guardIframes) end)
+-- HBG: iframes via startNoHitTimer (beginDodgeNoHit is for dodge, not guard).
+local function grantIframesHBG(iframes)
+    if not character then return end
+    pcall(function() character:call("startNoHitTimer(System.Single)", iframes) end)
+    pcall(function() character:call("startNoHitTimer", iframes) end)
 end
 
--- Fire Bow perfect dodge (requires weapon drawn, Cat>=1)
-local function doDodge(ctrl)
-    -- beginDodgeNoHit sets the pre-dodge state (Cat=2 Idx=9), then upgrade to perfect dodge
+-- Bow: beginDodgeNoHit(System.Boolean, false) triggers pre-dodge state (Cat=2 Idx=9),
+-- then changeActionRequest(2, 33) upgrades it to perfect dodge.
+-- startNoHitTimer provides iframes throughout.
+local function grantIframesBow(iframes)
+    if not character then return end
     local ok = pcall(function() character:call("beginDodgeNoHit(System.Boolean)", false) end)
-    if not ok then pcall(function() character:call("beginDodgeNoHit(System.Single)", cfg.evadeIframes) end) end
+    if not ok then pcall(function() character:call("beginDodgeNoHit(System.Single)", iframes) end) end
     if not ok then pcall(function() character:call("beginDodgeNoHit(System.Int32)", 0) end) end
-    sendAction(ctrl, 2, 33)  -- perfect dodge
-    pcall(function() character:call("startNoHitTimer(System.Single)", cfg.evadeIframes) end)
-    pcall(function() character:call("startNoHitTimer", cfg.evadeIframes) end)
+    if not ok then pcall(function() character:call("beginDodgeNoHit(System.Boolean,System.Single)", false, iframes) end) end
+    pcall(function() character:call("startNoHitTimer(System.Single)", iframes) end)
+    pcall(function() character:call("startNoHitTimer", iframes) end)
 end
 
--- Player update + deferred action processing
+-- Player update
 re.on_pre_application_entry('BeginRendering', function()
     local ok, char = pcall(function()
         local pm = sdk.get_managed_singleton('app.PlayerManager')
@@ -115,36 +113,9 @@ re.on_pre_application_entry('BeginRendering', function()
         character = char
         local wok, wt = pcall(function() return char:get_WeaponType() end)
         weaponType = wok and wt or -1
-        pcall(function()
-            local ctrl = char:call("get_BaseActionController")
-            if ctrl then
-                local id = ctrl:call("get_CurrentActionID")
-                if id then baseActionCat = id:get_field("_Category") end
-            end
-        end)
     else
-        character = nil; weaponType = -1; baseActionCat = 0; pending = nil
-        return
-    end
-
-    -- Fire deferred guard/dodge once the weapon is drawn
-    if pending then
-        if baseActionCat >= 1 then
-            local ctrl = safe(function() return character:call("get_BaseActionController") end)
-            if ctrl then
-                if pending == "guard" then
-                    doGuard(ctrl)
-                    log.info('[AD] deferred guard fired')
-                else
-                    doDodge(ctrl)
-                    log.info('[AD] deferred dodge fired')
-                end
-            end
-            pending = nil
-        elseif (os.clock() - pendingAt) > PENDING_MAX then
-            log.info('[AD] deferred action timed out (weapon never drawn)')
-            pending = nil
-        end
+        character  = nil
+        weaponType = -1
     end
 end)
 
@@ -167,61 +138,57 @@ if hitMethod then
 
             if not cfg.bypassChecks then
                 if not character then return end
+
                 local mine = false
                 pcall(function() mine = sdk.to_managed_object(args[1]) == character end)
-                if not mine then pcall(function() mine = sdk.to_managed_object(args[2]) == character end) end
+                if not mine then
+                    pcall(function() mine = sdk.to_managed_object(args[2]) == character end)
+                end
                 if not mine then return end
 
                 local enemy = false
-                for _, i in ipairs({2, 3}) do
-                    if enemy then break end
+                pcall(function()
+                    local info = sdk.to_managed_object(args[2])
+                    if not info then return end
+                    local owner = info:get_AttackOwner()
+                    if not owner then return end
+                    local name = owner:get_name()
+                    if not name then return end
+                    enemy = name:find("Em") ~= nil or name:find("Gm") ~= nil
+                end)
+                if not enemy then
                     pcall(function()
-                        local info = sdk.to_managed_object(args[i])
+                        local info = sdk.to_managed_object(args[3])
                         if not info then return end
                         local owner = info:get_AttackOwner()
                         if not owner then return end
                         local name = owner:get_name()
-                        if name then enemy = name:find("Em") ~= nil or name:find("Gm") ~= nil end
+                        if not name then return end
+                        enemy = name:find("Em") ~= nil or name:find("Gm") ~= nil
                     end)
                 end
                 if not enemy then return end
             end
 
-            -- Determine what to do
-            local doingGuard = cfg.guardEnabled and weaponType == HBG
-            local doingDodge = cfg.evadeEnabled and (weaponType == BOW or weaponType == HBG)
-            if not doingGuard and not doingDodge then return end
-
             lastHitAt = now
-            dbg.triggered = dbg.triggered + 1
+            dbg.skipped = dbg.skipped + 1
 
-            local ctrl = safe(function() return character:call("get_BaseActionController") end)
+            log.info(string.format('[AD] HIT #%d  wt=%d  bypass=%s',
+                dbg.skipped, weaponType, tostring(cfg.bypassChecks)))
 
-            log.info(string.format('[AD] HIT #%d  wt=%d  Cat=%d  guard=%s  dodge=%s',
-                dbg.triggered, weaponType, baseActionCat,
-                tostring(doingGuard), tostring(doingDodge)))
-
-            if baseActionCat >= 1 then
-                -- Weapon already drawn — fire immediately
-                if ctrl then
-                    if doingGuard then
-                        doGuard(ctrl)
-                        log.info('[AD] guard immediate')
-                    else
-                        doDodge(ctrl)
-                        log.info('[AD] dodge immediate')
-                    end
-                end
+            if cfg.guardEnabled and weaponType == HBG then
+                grantIframesHBG(cfg.guardIframes)
+                triggerAction(ACT.HBG_PERFECT_GUARD.cat, ACT.HBG_PERFECT_GUARD.idx)
+                log.info('[AD] HBG guard triggered')
+            elseif cfg.evadeEnabled and (weaponType == BOW or weaponType == HBG) then
+                grantIframesBow(cfg.evadeIframes)
+                triggerAction(ACT.BOW_PERFECT_DODGE.cat, ACT.BOW_PERFECT_DODGE.idx)
+                log.info('[AD] bow perfect dodge triggered')
             else
-                -- Weapon sheathed — force draw, defer action to next frame
-                if ctrl then
-                    sendAction(ctrl, 1, 2)  -- draw from sheath (Cat=1 Idx=2)
-                end
-                pending   = doingGuard and "guard" or "dodge"
-                pendingAt = now
-                log.info('[AD] draw forced, pending=' .. pending)
+                log.info('[AD] weapon inactive (' .. tostring(weaponType) .. ')')
             end
 
+            -- Unconditional — block damage regardless of draw state
             return sdk.PreHookResult.SKIP_ORIGINAL
         end,
         function(retval) return retval end
@@ -287,11 +254,8 @@ re.on_draw_ui(function()
     c, cfg.bypassChecks = imgui.checkbox('Bypass mine/enemy checks', cfg.bypassChecks)
     changed = changed or c
     imgui.text(string.format('Hook fired:  %d', dbg.hookFired))
-    imgui.text(string.format('Triggered:   %d', dbg.triggered))
+    imgui.text(string.format('Triggered:   %d', dbg.skipped))
     imgui.text(string.format('Cooldown:    %d', dbg.cooldown))
-    imgui.text(string.format('Draw state:  Cat=%d  %s',
-        baseActionCat, baseActionCat == 0 and '(sheathed)' or '(drawn)'))
-    imgui.text(string.format('Pending:     %s', tostring(pending)))
     if imgui.button('Reset counters') then
         for k in pairs(dbg) do dbg[k] = 0 end
     end
